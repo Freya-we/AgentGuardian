@@ -1,0 +1,577 @@
+@import url("https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&display=swap");
+
+:root {
+  color-scheme: dark;
+  --bg: #050607;
+  --panel: #101417;
+  --panel-2: #151b1f;
+  --line: #263137;
+  --text: #e7ece8;
+  --muted: #94a39b;
+  --green: #39e58c;
+  --cyan: #5cc8ff;
+  --amber: #ffbd52;
+  --red: #ff5f64;
+  --focus: #9ce8ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Fira Sans", system-ui, sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.app-shell {
+  width: min(1480px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 20px 0 28px;
+}
+
+.status-bar,
+.alert-banner,
+.panel,
+.metric-card {
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.status-bar {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+}
+
+.brand,
+.status-cluster,
+.status-pill,
+.alert-banner,
+.chain-list li,
+.taint-tag,
+.log-row,
+.stat-foot {
+  display: flex;
+  align-items: center;
+}
+
+.brand {
+  gap: 12px;
+  min-width: 220px;
+}
+
+.brand svg {
+  color: var(--green);
+}
+
+.brand strong {
+  display: block;
+  font: 700 20px/1.1 "Fira Code", monospace;
+}
+
+.brand span,
+.panel-title span,
+.metric-card span,
+.chain-list span,
+.config-panel p,
+.stat-foot,
+.log-row time {
+  color: var(--muted);
+}
+
+.status-cluster {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.status-pill,
+.session-chip {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: #0b0e10;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.status-pill {
+  gap: 7px;
+}
+
+.status-pill svg {
+  width: 16px;
+}
+
+.status-pill b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.status-pill.online svg,
+.status-pill.online b {
+  color: var(--green);
+}
+
+.status-pill.standby svg,
+.status-pill.connecting svg {
+  color: var(--amber);
+}
+
+.session-chip {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "Fira Code", monospace;
+}
+
+.alert-banner {
+  min-height: 48px;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+}
+
+.alert-banner.quiet svg {
+  color: var(--green);
+}
+
+.alert-banner.hot {
+  border-color: rgba(255, 95, 100, 0.65);
+  background: rgba(255, 95, 100, 0.09);
+}
+
+.alert-banner.hot svg,
+.alert-banner.hot strong {
+  color: var(--red);
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.metric-card {
+  min-height: 104px;
+  padding: 16px;
+  border-radius: 8px;
+}
+
+.metric-card strong {
+  display: block;
+  margin-top: 14px;
+  font: 700 30px/1 "Fira Code", monospace;
+}
+
+.metric-card.good strong {
+  color: var(--green);
+}
+
+.metric-card.warn strong {
+  color: var(--amber);
+}
+
+.metric-card.bad strong {
+  color: var(--red);
+}
+
+.workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.25fr) minmax(260px, 0.8fr) minmax(340px, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.panel {
+  min-height: 280px;
+  border-radius: 8px;
+  padding: 15px;
+  overflow: hidden;
+}
+
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-title h2 {
+  margin: 0;
+  font: 700 16px/1.2 "Fira Code", monospace;
+  letter-spacing: 0;
+}
+
+.chain-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.chain-list li {
+  position: relative;
+  min-height: 48px;
+  gap: 10px;
+  padding: 8px 0;
+}
+
+.chain-list svg {
+  width: 19px;
+  min-width: 19px;
+  z-index: 1;
+  background: var(--panel);
+}
+
+.chain-list li.allow svg,
+.bar-row.allow span {
+  color: var(--green);
+}
+
+.chain-list li.ask svg,
+.bar-row.ask span {
+  color: var(--amber);
+}
+
+.chain-list li.block svg,
+.bar-row.block span {
+  color: var(--red);
+}
+
+.chain-list strong,
+.chain-list span,
+.chain-list em,
+.chain-list code,
+.chain-list small {
+  display: block;
+}
+
+.chain-list em,
+.chain-list code,
+.chain-list small {
+  max-width: 100%;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font: 500 11px/1.25 "Fira Code", monospace;
+  font-style: normal;
+}
+
+.chain-list code {
+  color: var(--cyan);
+}
+
+.chain-list small {
+  color: var(--amber);
+}
+
+.chain-list b {
+  margin-left: auto;
+  font: 600 12px/1 "Fira Code", monospace;
+  text-transform: uppercase;
+}
+
+.chain-rail {
+  position: absolute;
+  left: 9px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+
+.tag-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.taint-tag {
+  min-height: 34px;
+  gap: 7px;
+  border: 1px solid rgba(92, 200, 255, 0.35);
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: var(--cyan);
+  background: rgba(92, 200, 255, 0.07);
+  font: 500 12px/1.2 "Fira Code", monospace;
+}
+
+.taint-tag svg {
+  width: 15px;
+}
+
+.chart-panel,
+.config-panel {
+  grid-row: span 2;
+}
+
+.config-panel {
+  min-height: 430px;
+}
+
+.config-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.config-actions span {
+  color: var(--muted);
+  font: 500 12px/1.2 "Fira Code", monospace;
+}
+
+.tool-button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: #0b0e10;
+  cursor: pointer;
+}
+
+.tool-button.primary {
+  border-color: rgba(57, 229, 140, 0.45);
+  color: var(--green);
+  background: rgba(57, 229, 140, 0.08);
+}
+
+.tool-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.tool-button svg {
+  width: 16px;
+}
+
+.config-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.config-editor span {
+  color: var(--muted);
+  font: 500 12px/1.2 "Fira Code", monospace;
+}
+
+.config-editor textarea {
+  width: 100%;
+  min-height: 312px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--text);
+  background: #090c0e;
+  font: 500 12px/1.55 "Fira Code", monospace;
+}
+
+.config-error {
+  max-height: 120px;
+  overflow: auto;
+  margin: 10px 0 0;
+  border: 1px solid rgba(255, 95, 100, 0.45);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--red);
+  background: rgba(255, 95, 100, 0.08);
+  white-space: pre-wrap;
+  font: 500 12px/1.45 "Fira Code", monospace;
+}
+
+.bar-chart {
+  display: grid;
+  gap: 12px;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 32px;
+  align-items: center;
+  gap: 9px;
+  font: 500 12px/1 "Fira Code", monospace;
+}
+
+.bar-row div {
+  height: 10px;
+  border-radius: 999px;
+  background: #0b0e10;
+  overflow: hidden;
+}
+
+.bar-row i {
+  display: block;
+  height: 100%;
+  min-width: 3px;
+  border-radius: 999px;
+  background: var(--green);
+}
+
+.bar-row.ask i {
+  background: var(--amber);
+}
+
+.bar-row.block i {
+  background: var(--red);
+}
+
+.sparkline {
+  width: 100%;
+  height: 116px;
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.sparkline path {
+  fill: none;
+  stroke: var(--cyan);
+  stroke-width: 3;
+}
+
+.stat-foot {
+  justify-content: space-between;
+  margin-top: 12px;
+  gap: 10px;
+  font: 500 12px/1.3 "Fira Code", monospace;
+}
+
+.event-stream {
+  margin-top: 12px;
+  min-height: 270px;
+}
+
+.log-table {
+  display: grid;
+  gap: 1px;
+  max-height: 430px;
+  overflow: auto;
+  background: #0b0e10;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.log-row {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: 18px 86px minmax(120px, 180px) 1fr;
+  gap: 10px;
+  padding: 9px 10px;
+  background: var(--panel);
+  font: 500 12px/1.35 "Fira Code", monospace;
+}
+
+.log-row svg {
+  width: 16px;
+  color: var(--muted);
+}
+
+.log-row strong {
+  color: var(--cyan);
+}
+
+.empty-state {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font: 500 13px/1.3 "Fira Code", monospace;
+}
+
+@media (max-width: 1100px) {
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .chart-panel {
+    grid-row: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    width: min(100vw - 20px, 720px);
+    padding-top: 10px;
+  }
+
+  .status-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .status-cluster {
+    justify-content: flex-start;
+  }
+
+  .metrics-grid,
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-card {
+    min-height: 90px;
+  }
+
+  .log-row {
+    grid-template-columns: 18px 76px 1fr;
+  }
+
+  .log-row span {
+    grid-column: 2 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tool-button,
+  .status-pill,
+  .metric-card,
+  .panel {
+    transition:
+      border-color 180ms ease,
+      background-color 180ms ease,
+      transform 180ms ease;
+  }
+
+  .tool-button:hover {
+    transform: translateY(-1px);
+  }
+}

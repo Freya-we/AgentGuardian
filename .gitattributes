@@ -1,0 +1,7 @@
+# 统一 LF：本项目面向 Linux 运行时，shell 脚本在 CRLF 下无法执行
+* text=auto eol=lf
+
+# 二进制文件
+*.png binary
+*.pdf binary
+*.onnx binary

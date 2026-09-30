@@ -1,0 +1,169 @@
+{
+  "templates": [
+    {
+      "id": "resume_summary",
+      "label": "简历摘要任务",
+      "graph": {
+        "read_file": [
+          "summarize",
+          "search_web"
+        ],
+        "summarize": [
+          "send_email"
+        ],
+        "search_web": [
+          "summarize"
+        ]
+      },
+      "terminals": [
+        "send_email"
+      ],
+      "forbidden_tool_categories": [],
+      "require_slm_review": [
+        "send_email"
+      ]
+    },
+    {
+      "id": "db_query_optimization",
+      "label": "数据库查询优化",
+      "graph": {
+        "db_query": [
+          "db_query",
+          "summarize"
+        ],
+        "summarize": []
+      },
+      "terminals": [
+        "summarize"
+      ],
+      "forbidden_tool_categories": [
+        "DDL",
+        "DCL"
+      ],
+      "require_slm_review": []
+    },
+    {
+      "id": "code_review",
+      "label": "代码审查任务",
+      "graph": {
+        "read_file": [
+          "analyze_code",
+          "run_tests"
+        ],
+        "analyze_code": [
+          "write_report",
+          "suggest_fix"
+        ],
+        "run_tests": [
+          "write_report"
+        ],
+        "suggest_fix": [
+          "write_report"
+        ]
+      },
+      "terminals": [
+        "write_report"
+      ],
+      "forbidden_tool_categories": [
+        "bash_exec",
+        "file_delete"
+      ],
+      "require_slm_review": [
+        "write_report"
+      ]
+    },
+    {
+      "id": "email_processing",
+      "label": "邮件处理任务",
+      "graph": {
+        "read_email": [
+          "summarize",
+          "classify"
+        ],
+        "classify": [
+          "send_email",
+          "archive"
+        ],
+        "summarize": [
+          "send_email"
+        ]
+      },
+      "terminals": [
+        "send_email",
+        "archive"
+      ],
+      "forbidden_tool_categories": [
+        "file_delete",
+        "config_modify"
+      ],
+      "require_slm_review": [
+        "send_email"
+      ]
+    },
+    {
+      "id": "file_organization",
+      "label": "文件整理任务",
+      "graph": {
+        "list_files": [
+          "classify_file",
+          "read_file"
+        ],
+        "classify_file": [
+          "move_file",
+          "rename_file"
+        ],
+        "read_file": [
+          "summarize"
+        ]
+      },
+      "terminals": [
+        "move_file",
+        "rename_file",
+        "summarize"
+      ],
+      "forbidden_tool_categories": [
+        "file_delete",
+        "bash_exec",
+        "config_modify"
+      ],
+      "require_slm_review": [
+        "move_file"
+      ]
+    },
+    {
+      "id": "data_scraping",
+      "label": "数据爬取任务",
+      "graph": {
+        "fetch_url": [
+          "parse_html",
+          "fetch_url"
+        ],
+        "parse_html": [
+          "extract_data",
+          "fetch_url"
+        ],
+        "extract_data": [
+          "write_file",
+          "db_insert"
+        ]
+      },
+      "terminals": [
+        "write_file",
+        "db_insert"
+      ],
+      "forbidden_tool_categories": [
+        "bash_exec",
+        "config_modify"
+      ],
+      "require_slm_review": [
+        "fetch_url"
+      ]
+    }
+  ],
+  "global_blacklist": [
+    "bash_exec",
+    "file_delete",
+    "config_modify"
+  ],
+  "default_mode": "ask"
+}
