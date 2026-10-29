@@ -20,7 +20,6 @@ dependencies = [
     { name = "httpx" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "onnxruntime" },
     { name = "pillow" },
     { name = "pypdf2" },
     { name = "sqlparse" },
@@ -35,6 +34,10 @@ export = [
 ]
 frida-server = [
     { name = "frida-tools" },
+]
+slm = [
+    { name = "onnxruntime" },
+    { name = "transformers" },
 ]
 
 [package.dev-dependencies]
@@ -55,16 +58,17 @@ requires-dist = [
     { name = "frida-tools", marker = "extra == 'frida-server'", specifier = ">=14.10.4" },
     { name = "httpx" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "onnxruntime", specifier = ">=1.18" },
+    { name = "onnxruntime", marker = "extra == 'slm'", specifier = ">=1.18" },
     { name = "optimum", extras = ["onnxruntime"], marker = "extra == 'export'", specifier = ">=1.22" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pypdf2", specifier = ">=3.0.1" },
     { name = "sentence-transformers", marker = "extra == 'export'", specifier = ">=3.0" },
     { name = "sqlparse", specifier = ">=0.5" },
+    { name = "transformers", marker = "extra == 'slm'", specifier = ">=4.40" },
     { name = "uvicorn", extras = ["standard"] },
     { name = "watchfiles", specifier = ">=0.21" },
 ]
-provides-extras = ["export", "frida-server"]
+provides-extras = ["slm", "export", "frida-server"]
 
 [package.metadata.requires-dev]
 dev = [

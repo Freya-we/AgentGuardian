@@ -1,5 +1,7 @@
 import asyncio
 import atexit
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -10,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, WebSocket
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field
 from watchfiles import awatch
 
@@ -29,7 +31,7 @@ from src.engine.websocket_manager import WebSocketManager
 class SignRequest(BaseModel):
     pid: int
     tool_name: str
-    params_hash: str
+    params_hash: str = ""  # 已废弃：引擎不信任该字段，签名一律用自行计算的 sha256(params)
     params: str = ""  # 原始参数文本 (SQL 解析和内容审查用)
     input_messages: str
     session_id: str
@@ -41,6 +43,9 @@ class SignResponse(BaseModel):
     taint_tags: list[str] = []
     reason: str = ""
     mode: str = "ask"
+    # 签发票据时使用的时间戳，必须由调用方原样带回 causal-guardian。
+    # 否则 guardian 无法重建 HMAC payload（验签必失败），见 P0-1 断点①。
+    timestamp_ns: int | None = None
 
 
 class ToolCallEvent(BaseModel):
@@ -137,6 +142,15 @@ class _TtlCache:
     def clear(self) -> None:
         self._data.clear()
 
+    def purge_expired(self) -> int:
+        """主动删除全部已过期条目。平时靠访问时惰性淘汰，
+        长期不再被访问的条目需要定时清扫（否则占满 maxsize 前一直驻留）。"""
+        now = time.monotonic()
+        expired = [k for k, (_, ts) in self._data.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._data[k]
+        return len(expired)
+
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not None
 
@@ -186,6 +200,8 @@ class AppState:
     session_templates: _TtlCache = field(default_factory=lambda: _TtlCache(maxsize=4096, ttl_seconds=3600))
     session_system_prompts: dict[str, str] = field(default_factory=dict)
     keys: SessionKeys | None = None
+    api_token: str | None = None
+    last_call_ns: dict[str, int] = field(default_factory=dict)
     config_path: Path = Path("config/task_templates.json")
 
 
@@ -255,6 +271,59 @@ def _write_task_templates_config(config: TaskTemplatesConfig) -> None:
 
 logger = logging.getLogger("agent-guardian")
 
+ENGINE_TOKEN_PATH = "/etc/agent-guardian/engine.token"
+
+
+def _load_api_token() -> str | None:
+    """读取引擎 API 令牌（P0-1）。
+
+    优先级：环境变量 AGENT_GUARDIAN_TOKEN > /etc/agent-guardian/engine.token。
+    两者都没有时：生产模式直接拒绝启动；开发/测试模式关闭鉴权并告警。
+    """
+    token = os.environ.get("AGENT_GUARDIAN_TOKEN", "").strip()
+    if not token:
+        try:
+            token = Path(ENGINE_TOKEN_PATH).read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if token:
+        logger.info("引擎 API 鉴权已启用（令牌长度 %d）", len(token))
+        return token
+    if os.environ.get("AGENT_GUARDIAN_ENV") == "production":
+        raise RuntimeError(
+            "生产模式必须配置 API 令牌：环境变量 AGENT_GUARDIAN_TOKEN "
+            f"或文件 {ENGINE_TOKEN_PATH}"
+        )
+    logger.warning(
+        "未配置 API 令牌，引擎鉴权关闭（仅限开发/测试）。"
+        "生产环境必须设置 AGENT_GUARDIAN_TOKEN，否则任何本地进程都能换取通行证。"
+    )
+    return None
+
+
+def _pid_gate_enabled() -> bool:
+    """引擎侧 pid 存活校验是否启用（**默认关闭**）。
+
+    只有在"引擎与 Agent 处于同一 PID 命名空间"时，检查 /proc/<pid> 才有意义。
+    跨命名空间部署（引擎在 host、Agent 在容器）时它有两种失效方式：
+      · /proc/<pid> 不存在          → 误杀合法请求
+      · /proc/<pid> 恰好是别的进程  → 误放
+    两种都不可接受，所以默认不做这个校验。
+
+    真正的 pid 权威在 causal-guardian：它对照 root 维护的 monitored_tgid
+    （key 是目标命名空间内的 tgid），不在名单内一律拒绝写票据（status=3）。
+    确需开启本开关时设 AGENT_GUARDIAN_PID_GATE=1。
+    """
+    return os.environ.get("AGENT_GUARDIAN_PID_GATE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _pid_exists(pid: int) -> bool:
+    """同命名空间内检查进程是否存在；无 /proc 的平台返回 True（跳过）。"""
+    if not os.path.isdir("/proc"):
+        return True
+    return os.path.isdir(f"/proc/{pid}")
+
+
 
 def _sync_blacklist() -> None:
     try:
@@ -291,6 +360,17 @@ async def lifespan(_app: FastAPI):
         atexit.register(_cleanup_temp_key)
         state.keys = state.key_manager.initialize(tmp_key.name)
 
+    # P0-2：启动即把 session key 推送到 causal-guardian。
+    # 不推送的话，BPF 的 session_key map 保持全零，guardian 会拿零 key 验签，
+    # 所有票据注册都失败 —— 表现为 L1 层"静默失效"。
+    if not state.key_manager.push_current():
+        logger.error(
+            "初始 session key 未能推送到 causal-guardian：L1 层将拒绝所有票据。"
+            "请确认 causal-guardian 已启动且 socket 可写。"
+        )
+
+    state.api_token = _load_api_token()
+
     # 从配置加载全局黑名单
     try:
         config_data = _read_task_templates_config()
@@ -300,7 +380,7 @@ async def lifespan(_app: FastAPI):
 
     asyncio.create_task(_rotate_keys())
     asyncio.create_task(_watch_config())
-    asyncio.create_task(_cleanup_taint_sessions())
+    asyncio.create_task(_cleanup_expired_sessions())
 
     yield
     # shutdown
@@ -316,12 +396,36 @@ def _cleanup_temp_key() -> None:
         _temp_key_path = None
 
 
-async def _cleanup_taint_sessions():
-    """定时清理过期的污点追踪会话"""
+def _sweep_stale_sessions() -> int:
+    """回收所有过期会话的状态，返回回收的会话数量。
+
+    taint_tracker 是唯一记录访问时间的容器：sign 链路上每个会话都会写污点条目，
+    所以以它的 TTL 为过期基准。两类会话需要回收：
+    1. 污点已过期的（超过 TTL 未访问）；
+    2. 只出现在图约束/系统提示缓存里、在污点容器中已不存在的——即"从未走过
+       sign 链路"或"污点刚被清理"的残留。回收后下次 sign 会重新匹配模板，自愈。
+    修复前 forget_session 定义了但无人调用，除污点外的容器仍无界增长。
+    """
+    stale: set[str] = set(state.taint_tracker.expired_session_ids())
+    state.taint_tracker.cleanup_old_sessions()
+    active = set(state.taint_tracker.active_session_ids())
+    stale |= (set(state.graph_constraint.session_ids())
+              | set(state.session_system_prompts)) - active
+    for sid in stale:
+        state.graph_constraint.forget_session(sid)
+        state.stats_baseline.reset(sid)
+        state.last_call_ns.pop(sid, None)
+        state.session_system_prompts.pop(sid, None)
+    state.session_templates.purge_expired()
+    return len(stale)
+
+
+async def _cleanup_expired_sessions():
+    """定时回收过期会话状态（污点 / 图约束 / 统计 / 最后调用时间 / 系统提示）"""
     while True:
         await asyncio.sleep(1800)  # 每 30 分钟
         try:
-            removed = state.taint_tracker.cleanup_old_sessions()
+            removed = _sweep_stale_sessions()
             if removed:
                 await _record_and_broadcast({
                     "type": "session_cleanup",
@@ -331,7 +435,29 @@ async def _cleanup_taint_sessions():
             pass
 
 
-app = FastAPI(title="Agent-Guardian", lifespan=lifespan)
+def require_token(
+    request: Request,
+    x_guardian_token: str | None = Header(default=None, alias="X-Guardian-Token"),
+) -> None:
+    """全局认证依赖（P0-1）。
+
+    修复前所有 /api/v1/* 均无鉴权：任何本地进程都能拿任意 PID 换通行证、
+    改写安全策略、订阅事件流。未配置令牌时视为开发模式（启动已告警）。
+    """
+    if request.url.path == "/health":
+        request.state.guardian_token = "dev"
+        return
+    if state.api_token is None:
+        request.state.guardian_token = "dev"
+        return
+    if not x_guardian_token or not hmac.compare_digest(x_guardian_token, state.api_token):
+        raise HTTPException(status_code=401,
+                            detail="missing or invalid X-Guardian-Token")
+    request.state.guardian_token = x_guardian_token
+
+
+app = FastAPI(title="Agent-Guardian", lifespan=lifespan,
+              dependencies=[Depends(require_token)])
 
 
 async def _rotate_keys():
@@ -357,17 +483,32 @@ async def _watch_config():
         })
 
 
-_rate_buckets: dict[str, tuple[float, int]] = defaultdict(lambda: (time.monotonic(), 60))
-_rate_lock = asyncio.Lock()
-_RATE_LIMIT = 60   # 每分钟请求数
+# 按"调用方身份"（API 令牌）限流，而不是按客户端自填的 session_id（P1-7）。
+_RATE_LIMIT = int(os.environ.get("AGENT_GUARDIAN_RATE_LIMIT", "60"))  # 每分钟请求数
 _RATE_WINDOW = 60  # 窗口秒数
+_RATE_BUCKETS_MAX = 1024
+_rate_buckets: dict[str, tuple[float, int]] = {}
+_rate_lock = asyncio.Lock()
+
+
+def _prune_rate_buckets(now: float) -> None:
+    """字典有上限：超过上限时清理过期桶，避免无界增长"""
+    if len(_rate_buckets) <= _RATE_BUCKETS_MAX:
+        return
+    expired = [
+        k for k, (start, _) in _rate_buckets.items()
+        if now - start > _RATE_WINDOW * 2
+    ]
+    for k in expired:
+        _rate_buckets.pop(k, None)
 
 
 async def _check_rate_limit(key: str) -> bool:
     """简易令牌桶，返回 True 表示未超限"""
     async with _rate_lock:
-        window_start, tokens = _rate_buckets[key]
         now = time.monotonic()
+        _prune_rate_buckets(now)
+        window_start, tokens = _rate_buckets.get(key, (now, _RATE_LIMIT))
         if now - window_start > _RATE_WINDOW:
             window_start = now
             tokens = _RATE_LIMIT
@@ -378,28 +519,58 @@ async def _check_rate_limit(key: str) -> bool:
 
 
 @app.post("/api/v1/causal-id/sign", response_model=SignResponse)
-async def handle_sign_request(req: SignRequest) -> SignResponse:
-    if not await _check_rate_limit(req.session_id):
+async def handle_sign_request(req: SignRequest,
+                               request: Request = None) -> SignResponse:
+    # request 为 None 表示进程内直接调用（单元测试），不再从 HTTP 层取身份。
+    # 注意注解保持 Request 本身（不能写成 Request | None）：FastAPI 只有识别出
+    # 裸 Request 注解才会注入，联合类型会被当成请求体字段。
+    identity = (getattr(request.state, "guardian_token", "dev")
+                if request is not None else "dev")
+    if not await _check_rate_limit(identity):
         return SignResponse(
             decision="block",
             reason="请求频率超限，请稍后重试",
             mode="ask",
         )
 
-    now_ns = time.time_ns()
+    # P0-1b：pid 合法性门禁 —— 请求体的 pid 不再无条件信任。
+    # 这里挡掉非法/不存在的 pid；强制门禁在 causal-guardian（只给
+    # monitored_tgid 名单内、且 root 可控的 pid 写内核票据）。
+    if req.pid <= 0:
+        return SignResponse(
+            decision="block",
+            reason="非法 pid：必须为正整数",
+            mode="ask",
+        )
+    # 默认关闭：跨命名空间时 /proc 校验不可靠，pid 权威在 causal-guardian
+    if _pid_gate_enabled() and not _pid_exists(req.pid):
+        return SignResponse(
+            decision="block",
+            reason=f"pid {req.pid} 不存在，拒绝签发",
+            mode="ask",
+        )
+
+    # 必须用单调时钟：内核用 bpf_ktime_get_ns() 比较 TTL，
+    # 若这里用 time.time_ns()（墙上时钟），差值会回绕成天文数字，票一写就"过期"。
+    now_ns = time.monotonic_ns()
+
+    # P1-2：签名绑定参数指纹。请求体里的 params_hash 不可信——攻击者可以
+    # 提交"干净"的 params 通过内容审查，却附带恶意内容的 hash 来换票；
+    # 引擎一律自己重算 sha256(params)，bridge 注册时也用同一算法，两端一致。
+    params_hash = hashlib.sha256(req.params.encode("utf-8")).hexdigest()
 
     # 1. 模板匹配（首次匹配后缓存，TTL 1h + 容量限制 4096）
     if req.session_id not in state.session_templates:
         template, method = state.template_matcher.match(req.input_messages)
         if template is not None:
             state.session_templates.set(req.session_id, template.id)
-            state.graph_constraint.load_template(template)
+            state.graph_constraint.load_template(template, req.session_id)
 
     # 2. 污点传播
     previous_tags = {
         t.value for t in state.taint_tracker.get_active_tags(req.session_id)
     }
-    tags = state.taint_tracker.propagate(req.session_id, req.tool_name, req.params_hash)
+    tags = state.taint_tracker.propagate(req.session_id, req.tool_name, params_hash)
     tags_str = [t.value for t in tags]
     if tags_str and set(tags_str) != previous_tags:
         asyncio.create_task(_record_and_broadcast(
@@ -409,7 +580,7 @@ async def handle_sign_request(req: SignRequest) -> SignResponse:
     # 3. SQL 分析 (DDL/DCL 操作直接阻断)
     sql_tools = {"db_query", "sql_exec", "sql_query"}
     if req.tool_name in sql_tools and req.params:
-        forbidden = state.graph_constraint.forbidden_categories
+        forbidden = state.graph_constraint.forbidden_for(req.session_id)
         if forbidden:
             sql_analysis_result = state.sql_parser.analyze(req.params)
             if (sql_analysis_result.has_ddl and "DDL" in forbidden):
@@ -438,7 +609,8 @@ async def handle_sign_request(req: SignRequest) -> SignResponse:
     if result.decision == Decision.ALLOW:
         if state.keys is not None:
             causal_id = state.hmac_signer.sign(
-                state.keys.active, req.pid, req.tool_name, now_ns
+                state.keys.active, req.pid, req.tool_name, now_ns,
+                params_hash=params_hash,
             ).hex()
             asyncio.create_task(_record_and_broadcast({
                 "type": "causal_id_issued",
@@ -481,10 +653,11 @@ async def handle_sign_request(req: SignRequest) -> SignResponse:
                     "reason": rule_reason,
                 }))
 
-    # 6. 统计记录
+    # 6. 统计记录（用真实调用间隔；修复前这里写死 100ms，属于假指标 —— P1-6）
     graph_matched = result.decision == Decision.ALLOW
-    call_count = len(state.graph_constraint.get_path(req.session_id))
-    interval_ms = 100.0 if call_count > 1 else 0.0
+    last_ns = state.last_call_ns.get(req.session_id)
+    interval_ms = (now_ns - last_ns) / 1_000_000 if last_ns else 0.0
+    state.last_call_ns[req.session_id] = now_ns
     state.stats_baseline.record_call(
         req.session_id, req.tool_name, interval_ms,
         tainted=len(tags) > 0,
@@ -517,11 +690,18 @@ async def handle_sign_request(req: SignRequest) -> SignResponse:
         taint_tags=tags_str,
         reason=reason,
         mode="ask",
+        timestamp_ns=now_ns,
     )
 
 
 @app.websocket("/ws/events")
 async def websocket_events(ws: WebSocket):
+    # WebSocket 不受 HTTP 依赖保护，必须单独校验（P0-1）
+    if state.api_token is not None:
+        token = ws.query_params.get("token")
+        if not token or not hmac.compare_digest(token, state.api_token):
+            await ws.close(code=1008)
+            return
     await state.ws_manager.connect(ws)
     try:
         while True:
@@ -562,7 +742,7 @@ async def receive_system_prompt(req: SystemPromptRequest):
     template, method = state.template_matcher.match(req.system_prompt)
     if template:
         state.session_templates.set(req.session_id, template.id)
-        state.graph_constraint.load_template(template)
+        state.graph_constraint.load_template(template, req.session_id)
     else:
         state.session_system_prompts[req.session_id] = req.system_prompt
     return {

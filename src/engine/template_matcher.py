@@ -36,7 +36,9 @@ class TemplateMatcher:
         self._load()
 
     def _load(self) -> None:
-        with open(self._config_path) as f:
+        # 必须显式指定 UTF-8：配置里有中文标签，而 Windows 默认编码是 GBK，
+        # 不指定会直接 UnicodeDecodeError（引擎连启动都做不到）。
+        with open(self._config_path, encoding="utf-8") as f:
             config = json.load(f)
         self._templates = []
         self._tag_index = {}

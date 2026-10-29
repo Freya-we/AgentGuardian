@@ -38,8 +38,26 @@ static int open_bpf_map(const char *name, int *fd) {
 }
 
 static int handle_register(int causal_chain_fd, int session_key_fd,
+                           int monitored_fd,
                            struct msg_register *req, struct msg_ack *ack) {
     ack->type = MSG_REGISTER;
+
+    /* ── P0-1b：pid 门禁 —— 票据只能写给监控名单内的进程 ──
+     * monitored_tgid 由 root（loader -p）维护，权限 0600；不在这张表里的
+     * pid 拿到票据也没有意义（内核只拦名单内进程），提前拒绝可以防止
+     * 持 token 的调用方给任意（甚至受害者的）pid 铺票。 */
+    if (monitored_fd >= 0) {
+        __u8 mon = 0;
+        __u64 mpid = req->pid;
+        if (bpf_map_lookup_elem(monitored_fd, &mpid, &mon) != 0) {
+            ack->status = 3;  /* pid_not_monitored */
+            fprintf(stderr, "拒绝注册: pid=%llu 不在 monitored_tgid 中\n",
+                    (unsigned long long)req->pid);
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "警告: monitored_tgid 不可用，pid 门禁已跳过\n");
+    }
 
     /* ── 读取 session keys ── */
     __u32 key_active = 0, key_grace = 1;
@@ -53,10 +71,17 @@ static int handle_register(int causal_chain_fd, int session_key_fd,
         return -1;
     }
 
-    /* ── 重建 payload: pid|tool_name|timestamp_ns|ttl_ns ── */
-    char payload[256];
-    int plen = snprintf(payload, sizeof(payload), "%llu|%s|%llu|%llu",
-                        (unsigned long long)req->pid, req->tool_name,
+    /* ── 安全取出变长字段（消息是定长打包的，末字节可能不是 NUL）── */
+    char tool_name[64];
+    char params_hash[65];
+    snprintf(tool_name, sizeof(tool_name), "%s", (const char *)req->tool_name);
+    snprintf(params_hash, sizeof(params_hash), "%s", (const char *)req->params_hash);
+
+    /* ── 重建 payload: pid|tool_name|params_hash|timestamp_ns|ttl_ns ──
+     * 必须与引擎 HmacSigner.sign 的格式逐字节一致。 */
+    char payload[384];
+    int plen = snprintf(payload, sizeof(payload), "%llu|%s|%s|%llu|%llu",
+                        (unsigned long long)req->pid, tool_name, params_hash,
                         (unsigned long long)req->timestamp_ns,
                         (unsigned long long)CAUSAL_ID_TTL_NS);
     if (plen < 0 || plen >= (int)sizeof(payload)) {
@@ -120,6 +145,22 @@ static int handle_key_update(int session_key_fd, struct msg_key_update *req,
     if (ret1 || ret2)
         fprintf(stderr, "MSG_KEY_UPDATE 写入 Map 失败\n");
     return (ret1 || ret2) ? -1 : 0;
+}
+
+/* ── 处理 MSG_NS_UPDATE：写入 ns_id_map ── */
+static int handle_ns_update(int ns_map_fd, struct msg_ns_update *req,
+                            struct msg_ack *ack) {
+    ack->type = MSG_NS_UPDATE;
+    __u32 key = 0;
+    struct ns_id val = { .dev = req->dev, .ino = req->ino };
+    int ret = bpf_map_update_elem(ns_map_fd, &key, &val, BPF_ANY);
+    ack->status = (ret == 0) ? 0 : 1;
+    if (ret)
+        fprintf(stderr, "MSG_NS_UPDATE 写入 Map 失败: %s\n", strerror(-ret));
+    else
+        printf("命名空间标识已更新: dev=%llu ino=%llu\n",
+               (unsigned long long)req->dev, (unsigned long long)req->ino);
+    return ret;
 }
 
 static int check_peer_cred(int fd) {
@@ -247,8 +288,10 @@ static struct perf_buffer *open_alert_pb(void) {
     return pb;
 }
 
-static int process_client(int fd, int causal_chain_fd, int session_key_fd) {
-    uint8_t buf[128] = {0};
+static int process_client(int fd, int causal_chain_fd, int session_key_fd,
+                          int monitored_fd, int ns_map_fd) {
+    /* msg_register 是最大的消息（177 字节），缓冲必须容得下最长消息 */
+    uint8_t buf[256] = {0};
     ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (n <= 0) return -1;
 
@@ -256,11 +299,14 @@ static int process_client(int fd, int causal_chain_fd, int session_key_fd) {
     struct msg_ack ack = {0};
 
     if (type == MSG_REGISTER && n >= (ssize_t)sizeof(struct msg_register)) {
-        handle_register(causal_chain_fd, session_key_fd,
+        handle_register(causal_chain_fd, session_key_fd, monitored_fd,
                         (struct msg_register *)buf, &ack);
     } else if (type == MSG_KEY_UPDATE &&
                n >= (ssize_t)sizeof(struct msg_key_update)) {
         handle_key_update(session_key_fd, (struct msg_key_update *)buf, &ack);
+    } else if (type == MSG_NS_UPDATE &&
+               n >= (ssize_t)sizeof(struct msg_ns_update)) {
+        handle_ns_update(ns_map_fd, (struct msg_ns_update *)buf, &ack);
     } else {
         ack.type = type;
         ack.status = 2;  // 无效请求
@@ -273,6 +319,7 @@ static int process_client(int fd, int causal_chain_fd, int session_key_fd) {
 
 int main(int argc, char **argv) {
     int listen_fd = -1, causal_chain_fd = -1, session_key_fd = -1;
+    int monitored_fd = -1;
     struct sockaddr_un addr;
 
     signal(SIGINT, sig_handler);
@@ -281,6 +328,12 @@ int main(int argc, char **argv) {
     /* 1. 打开已固定的 BPF Maps */
     if (open_bpf_map("causal_chain", &causal_chain_fd)) return 1;
     if (open_bpf_map("session_key", &session_key_fd)) return 1;
+    int ns_map_fd = -1;
+    if (open_bpf_map("ns_id_map", &ns_map_fd))
+        fprintf(stderr, "警告: ns_id_map 不可用，命名空间 pid 换算将回退到 init 命名空间\n");
+    /* monitored_tgid 可选：缺失时（如单跑 guardian 的调试场景）pid 门禁降级为跳过 */
+    if (open_bpf_map("monitored_tgid", &monitored_fd))
+        fprintf(stderr, "警告: monitored_tgid 不可用，pid 门禁已关闭\n");
     printf("BPF Map 已打开: %s/causal_chain, session_key\n", MAP_PIN_DIR);
 
     /* 1b. 打开 perf buffer (alert_events → 审计引擎转发) */
@@ -334,7 +387,8 @@ int main(int argc, char **argv) {
 
         for (int i = 1; i < nfds; i++) {
             if (fds[i].revents & POLLIN) {
-                int rc = process_client(fds[i].fd, causal_chain_fd, session_key_fd);
+                int rc = process_client(fds[i].fd, causal_chain_fd,
+                                        session_key_fd, monitored_fd, ns_map_fd);
                 if (rc < 0) {
                     close(fds[i].fd);
                     fds[i] = fds[nfds - 1];

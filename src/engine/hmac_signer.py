@@ -9,19 +9,22 @@ CAUSAL_ID_TTL_NS = 5_000_000_000  # 5 秒
 class HmacSigner:
     """HMAC-SHA256 CausalID 签名器
 
-    Payload 格式: {pid}|{tool_name}|{timestamp_ns}|{ttl_ns}
-    TTL 嵌入签名防止重放攻击 — 窃取的 CausalID 仅在签发 + TTL 窗口内有效。
+    Payload 格式: {pid}|{tool_name}|{params_hash}|{timestamp_ns}|{ttl_ns}
+    TTL 嵌入签名防止重放攻击；params_hash（sha256 hex）把票据绑定到具体参数——
+    同一 pid/tool 的票据不能再挪用给不同内容的调用 (P1-2)。
     """
 
     def sign(self, session_key: bytes, pid: int, tool_name: str,
-             timestamp_ns: int, ttl_ns: int = CAUSAL_ID_TTL_NS) -> bytes:
-        payload = f"{pid}|{tool_name}|{timestamp_ns}|{ttl_ns}".encode()
+             timestamp_ns: int, ttl_ns: int = CAUSAL_ID_TTL_NS,
+             params_hash: str = "") -> bytes:
+        payload = f"{pid}|{tool_name}|{params_hash}|{timestamp_ns}|{ttl_ns}".encode()
         return hmac.new(session_key, payload, hashlib.sha256).digest()
 
     def verify(self, key: bytes, causal_id: bytes, pid: int,
                tool_name: str, timestamp_ns: int,
-               ttl_ns: int = CAUSAL_ID_TTL_NS) -> bool:
-        expected = self.sign(key, pid, tool_name, timestamp_ns, ttl_ns)
+               ttl_ns: int = CAUSAL_ID_TTL_NS,
+               params_hash: str = "") -> bool:
+        expected = self.sign(key, pid, tool_name, timestamp_ns, ttl_ns, params_hash)
         return hmac.compare_digest(expected, causal_id)
 
 

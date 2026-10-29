@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import time
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
@@ -80,9 +82,12 @@ async def test_sign_request_broadcasts_tool_call(monkeypatch):
 
     monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock(side_effect=capture))
     monkeypatch.setattr(server.state, "keys", None)
+    # 隔离图约束状态：本用例要验证的正是"没有匹配模板"的场景
+    from src.engine.graph_constraint import GraphConstraint
+    monkeypatch.setattr(server.state, "graph_constraint", GraphConstraint())
 
     req = SignRequest(
-        pid=321,
+        pid=os.getpid(),
         tool_name="read_file",
         params_hash="abc",
         input_messages="no matching template",
@@ -95,11 +100,12 @@ async def test_sign_request_broadcasts_tool_call(monkeypatch):
     tool_events = [
         event for event in broadcasts if event.get("type") == "tool_call"
     ]
-    assert response.decision == "allow"
+    # 没有匹配到任务模板 → fail-closed（P0-3），不再无条件放行
+    assert response.decision == "ask"
     assert len(tool_events) == 1
     assert tool_events[0]["session_id"] == "server-event-test"
     assert tool_events[0]["tool_name"] == "read_file"
-    assert tool_events[0]["decision"] == "allow"
+    assert tool_events[0]["decision"] == "ask"
 
 
 async def test_taint_source_endpoint_broadcasts_taint_update(monkeypatch):
@@ -215,7 +221,7 @@ async def test_db_query_ddl_blocked(monkeypatch):
     server.state.graph_constraint.forbidden_categories = ["DDL", "DCL"]
 
     req = SignRequest(
-        pid=101,
+        pid=os.getpid(),
         tool_name="db_query",
         params_hash="hash_drop_table",
         params="DROP TABLE users;",
@@ -235,7 +241,7 @@ async def test_db_query_select_allowed(monkeypatch):
     server.state.graph_constraint.forbidden_categories = ["DDL", "DCL"]
 
     req = SignRequest(
-        pid=102,
+        pid=os.getpid(),
         tool_name="db_query",
         params_hash="hash_select",
         params="SELECT * FROM users WHERE id = 1;",
@@ -254,7 +260,7 @@ async def test_db_query_dcl_blocked(monkeypatch):
     server.state.graph_constraint.forbidden_categories = ["DDL", "DCL"]
 
     req = SignRequest(
-        pid=103,
+        pid=os.getpid(),
         tool_name="db_query",
         params_hash="hash_grant",
         params="GRANT ALL PRIVILEGES ON *.* TO 'attacker'@'%';",
@@ -274,7 +280,7 @@ async def test_db_query_comment_bypass_blocked(monkeypatch):
     server.state.graph_constraint.forbidden_categories = ["DDL", "DCL"]
 
     req = SignRequest(
-        pid=104,
+        pid=os.getpid(),
         tool_name="db_query",
         params_hash="hash_comment_bypass",
         params="SELECT * FROM users; /*!50000 DROP TABLE audit_log; -- */",
@@ -285,3 +291,149 @@ async def test_db_query_comment_bypass_blocked(monkeypatch):
     response = await server.handle_sign_request(req)
     assert response.decision == "block"
     assert "DDL" in response.reason
+
+
+async def test_session_sweep_cleans_all_containers(monkeypatch):
+    """过期会话必须从污点/图约束/统计/last_call_ns 全部回收。
+
+    forget_session 曾定义了但无人调用，导致除污点外的容器无界增长（接线缺口）。
+    """
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+    monkeypatch.setattr(server.state, "keys", None)
+
+    req = SignRequest(
+        pid=os.getpid(),
+        tool_name="read_file",
+        params_hash="hash_sweep",
+        input_messages="no matching template",
+        session_id="sweep-me",
+    )
+    await server.handle_sign_request(req)
+    # 确认会话确实写进了各个容器（state 是模块级单例，可能有其他测试的残留会话）
+    assert server.state.last_call_ns.get("sweep-me") is not None
+    assert "sweep-me" in server.state.taint_tracker.active_session_ids()
+
+    # 时钟前进 2 小时，超过污点 TTL（1 小时）
+    now = time.monotonic()
+    monkeypatch.setattr("src.engine.taint_tracker.time.monotonic", lambda: now + 7200)
+    removed = server._sweep_stale_sessions()
+
+    assert removed >= 1
+    assert server.state.taint_tracker.get_active_tags("sweep-me") == []
+    assert server.state.graph_constraint.get_path("sweep-me") == []
+    assert server.state.last_call_ns.get("sweep-me") is None
+
+
+async def test_session_sweep_keeps_active_sessions(monkeypatch):
+    """活跃会话不受清扫影响"""
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+    monkeypatch.setattr(server.state, "keys", None)
+
+    req = SignRequest(
+        pid=202,
+        tool_name="read_file",
+        params_hash="hash_active",
+        input_messages="no matching template",
+        session_id="keep-me",
+    )
+    await server.handle_sign_request(req)
+
+    removed = server._sweep_stale_sessions()  # 不推进时钟
+    assert "keep-me" in server.state.taint_tracker.active_session_ids()
+    assert server.state.last_call_ns.get("keep-me") is not None
+
+
+def test_ttl_cache_purge_expired():
+    """_TtlCache 的惰性淘汰会漏掉长期不再访问的条目，purge_expired 兜底"""
+    cache = server._TtlCache(maxsize=10, ttl_seconds=0)
+    cache.set("k", "v")
+    time.sleep(0.01)
+    assert cache.purge_expired() == 1
+    assert "k" not in cache
+
+
+async def test_session_sweep_removes_prompt_only_orphans(monkeypatch):
+    """只在 system-prompt 通道出现、从未走过 sign 链路的会话也要回收"""
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+
+    server.state.session_system_prompts["prompt-only"] = "you are a helpful agent"
+    assert "prompt-only" not in set(server.state.taint_tracker.active_session_ids())
+
+    removed = server._sweep_stale_sessions()
+    assert "prompt-only" not in server.state.session_system_prompts
+    assert removed >= 1
+
+
+async def test_sign_rejects_nonpositive_pid(monkeypatch):
+    """P0-1b：pid <= 0 直接拒绝，不进入决策流程"""
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+
+    req = SignRequest(
+        pid=0,
+        tool_name="read_file",
+        params_hash="hash",
+        input_messages="no matching template",
+        session_id="pid-gate-test",
+    )
+    response = await server.handle_sign_request(req)
+    assert response.decision == "block"
+    assert "pid" in response.reason
+
+
+async def test_sign_rejects_nonexistent_pid(monkeypatch):
+    """P0-1b：引擎不可给不存在的进程签发票据（伪造 pid 铺票的第一道门）"""
+    monkeypatch.setenv("AGENT_GUARDIAN_PID_GATE", "1")  # 显式开启才校验 /proc
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+    monkeypatch.setattr(server, "_pid_exists", lambda pid: False)
+
+    req = SignRequest(
+        pid=999999,
+        tool_name="read_file",
+        params_hash="hash",
+        input_messages="no matching template",
+        session_id="pid-gate-test-2",
+    )
+    response = await server.handle_sign_request(req)
+    assert response.decision == "block"
+    assert "999999" in response.reason
+
+
+async def test_sign_passes_live_pid(monkeypatch):
+    """P0-1b：pid 合法时不被 pid 门禁拦截（走正常决策路径）"""
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+    monkeypatch.setattr(server.state, "keys", None)
+    monkeypatch.setattr(server, "_pid_exists", lambda pid: True)
+    from src.engine.graph_constraint import GraphConstraint
+    monkeypatch.setattr(server.state, "graph_constraint", GraphConstraint())
+
+    req = SignRequest(
+        pid=os.getpid(),
+        tool_name="read_file",
+        params_hash="attacker_chosen_hash",
+        input_messages="no matching template",
+        session_id="pid-gate-live",
+    )
+    response = await server.handle_sign_request(req)
+    # 活 pid + 无模板 → fail-closed 的 ASK（而不是 pid 门禁的 block）
+    assert response.decision == "ask"
+
+
+async def test_pid_gate_disabled_by_default(monkeypatch):
+    """默认不做 /proc 存活校验。
+
+    跨命名空间部署时它既可能误杀也可能误放，真正的 pid 权威在 causal-guardian
+    的 monitored_tgid 门禁。这里确认：即使进程"不存在"，也不会被这道门拦。
+    """
+    monkeypatch.delenv("AGENT_GUARDIAN_PID_GATE", raising=False)
+    monkeypatch.setattr(server.state.ws_manager, "broadcast", AsyncMock())
+    monkeypatch.setattr(server, "_pid_exists", lambda pid: False)
+
+    req = SignRequest(
+        pid=999999,
+        tool_name="read_file",
+        params_hash="hash",
+        input_messages="no matching template",
+        session_id="pid-gate-off",
+    )
+    response = await server.handle_sign_request(req)
+    assert "不存在" not in response.reason

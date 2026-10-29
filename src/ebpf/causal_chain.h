@@ -27,6 +27,7 @@
 #define SOCKET_PATH    "/var/run/causal-guardian.sock"
 #define MSG_REGISTER   0x01
 #define MSG_KEY_UPDATE 0x02
+#define MSG_NS_UPDATE  0x03   /* 推送 /proc 挂载点 dev/ino，用于命名空间 pid 换算 */
 
 /* ── alert_event 拦截原因 ── */
 #define ALERT_NO_CAUSAL_ID     0
@@ -62,10 +63,11 @@ struct alert_event {
 /* ── Unix Socket 消息 ── */
 struct msg_register {
     uint8_t  type;            // 0x01
-    uint64_t pid;             // 宿主机 PID (Frida 通过 NSpid 获取)
+    uint64_t pid;             // 本命名空间 pid（必须在 monitored_tgid 中，见 guardian handle_register）
     uint8_t  causal_id[32];   // HMAC-SHA256 签名后的 CausalID
-    uint64_t timestamp_ns;
+    uint64_t timestamp_ns;    // 引擎签名时的单调时钟值，必须原样回传
     uint8_t  tool_name[64];   // 工具名，HMAC payload 重建所需
+    uint8_t  params_hash[64]; // sha256(params) hex —— 票据绑定参数指纹 (P1-2)
 };
 
 struct msg_key_update {
@@ -74,9 +76,21 @@ struct msg_key_update {
     uint8_t  grace_key[32];   // 全 0 表示无旧 Key
 };
 
+/* ── 命名空间标识：/proc 挂载点的 dev + ino ── */
+struct ns_id {
+    uint64_t dev;
+    uint64_t ino;
+};
+
+struct msg_ns_update {
+    uint8_t  type;   /* 0x03 */
+    uint64_t dev;
+    uint64_t ino;
+};
+
 struct msg_ack {
     uint8_t  type;            // 0x01
-    uint8_t  status;          // 0=ok, 1=map_write_fail
+    uint8_t  status;          // 0=ok, 1=map_write_fail, 2=验签失败/无效请求, 3=pid 不在监控名单
 };
 
 #pragma pack()

@@ -47,6 +47,35 @@ struct {
     __uint(value_size, sizeof(__u32));
 } alert_events SEC(".maps");
 
+/* /proc 挂载点的 dev/ino（由 causal-guardian 写入），用于把内核视角 pid
+   换算成目标命名空间内的 pid —— 容器/WSL 里两者不相等。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct ns_id);
+} ns_id_map SEC(".maps");
+
+struct ns_pid_info {
+    __u32 pid;
+    __u32 tgid;
+};
+
+/* 返回目标命名空间内的 tgid；未配置或换算失败时回退到 init 命名空间。 */
+static __always_inline __u64 ns_tgid(void) {
+    __u32 zero = 0;
+    struct ns_id *ns = bpf_map_lookup_elem(&ns_id_map, &zero);
+    if (ns && ns->ino) {
+        struct ns_pid_info info = {0};
+        /* 显式转成内核声明的类型：布局一致（两个 u32），避免 -Wincompatible-pointer-types */
+        if (bpf_get_ns_current_pid_tgid(ns->dev, ns->ino,
+                                        (struct bpf_pidns_info *)&info,
+                                        sizeof(info)) == 0)
+            return info.tgid;
+    }
+    return bpf_get_current_pid_tgid() >> 32;
+}
+
 /* ── 白名单 BPF Map 精确查表 ── */
 static __always_inline int match_whitelist(const char *filename) {
     __u8 key[EXEC_WHITELIST_PATH_LEN] = {0};
@@ -63,19 +92,19 @@ static __always_inline int match_whitelist(const char *filename) {
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_enter_execve(struct trace_event_raw_sys_enter *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
     /* TGID 过滤: 仅拦截受监控的 Agent 进程 */
-    __u64 tgid = pid_tgid >> 32;
-    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &tgid);
+    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &key);
     if (!mon)
         return 0;
 
-    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
     if (entry) {
         __u64 now = bpf_ktime_get_ns();
         if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-            bpf_map_delete_elem(&causal_chain, &pid_tgid);
+            bpf_map_delete_elem(&causal_chain, &key);
             goto check_whitelist;
         }
         if (entry->flags & CAUSAL_FLAG_UNVERIFIED)
@@ -109,9 +138,10 @@ check_whitelist:
 SEC("tracepoint/syscalls/sys_exit_execve")
 int trace_exit_execve(struct trace_event_raw_sys_exit *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
     if (ctx->ret == 0) {
-        bpf_map_delete_elem(&causal_chain, &pid_tgid);
+        bpf_map_delete_elem(&causal_chain, &key);
     }
     return 0;
 }
@@ -162,18 +192,18 @@ int trace_enter_openat(struct trace_event_raw_sys_enter *ctx) {
         return 0;  // 纯读操作放行
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
-    __u64 tgid = pid_tgid >> 32;
-    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &tgid);
+    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &key);
     if (!mon)
         return 0;
 
-    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
     if (entry) {
         __u64 now = bpf_ktime_get_ns();
         if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-            bpf_map_delete_elem(&causal_chain, &pid_tgid);
+            bpf_map_delete_elem(&causal_chain, &key);
             goto openat_alert;
         }
         if (entry->flags & CAUSAL_FLAG_UNVERIFIED)
@@ -229,18 +259,18 @@ int trace_enter_connect(struct trace_event_raw_sys_enter *ctx) {
         return 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
-    __u64 __tgid = pid_tgid >> 32;
-    __u8 *_m = bpf_map_lookup_elem(&monitored_tgid, &__tgid);
+    __u8 *_m = bpf_map_lookup_elem(&monitored_tgid, &key);
     if (!_m)
         return 0;
 
-    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
     if (entry) {
         __u64 now = bpf_ktime_get_ns();
         if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-            bpf_map_delete_elem(&causal_chain, &pid_tgid);
+            bpf_map_delete_elem(&causal_chain, &key);
             goto connect_alert;
         }
         if (entry->flags & CAUSAL_FLAG_UNVERIFIED)
@@ -345,18 +375,18 @@ int trace_enter_chmod(struct trace_event_raw_sys_enter *ctx) {
         return 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
-    __u64 tgid = pid_tgid >> 32;
-    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &tgid);
+    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &key);
     if (!mon)
         return 0;
 
-    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
     if (entry) {
         __u64 now = bpf_ktime_get_ns();
         if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-            bpf_map_delete_elem(&causal_chain, &pid_tgid);
+            bpf_map_delete_elem(&causal_chain, &key);
             goto chmod_alert;
         }
         if (entry->flags & CAUSAL_FLAG_UNVERIFIED)
@@ -404,18 +434,18 @@ int trace_enter_fchmod(struct trace_event_raw_sys_enter *ctx) {
         return 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
-    __u64 tgid = pid_tgid >> 32;
-    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &tgid);
+    __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &key);
     if (!mon)
         return 0;
 
-    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+    struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
     if (entry) {
         __u64 now = bpf_ktime_get_ns();
         if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-            bpf_map_delete_elem(&causal_chain, &pid_tgid);
+            bpf_map_delete_elem(&causal_chain, &key);
             goto fchmod_alert;
         }
         if (entry->flags & CAUSAL_FLAG_UNVERIFIED)
@@ -432,13 +462,13 @@ fchmod_alert:
         evt.timestamp_ns = bpf_ktime_get_ns();
         evt.syscall_nr = __NR_fchmod;
         evt.reason = ALERT_NO_CAUSAL_ID;
-        int fd_val = (int)ctx->args[0];
+        /* 必须是无符号：BPF 不支持有符号除法/取模（clang: unsupported signed division） */
+        unsigned int fd_val = (unsigned int)ctx->args[0];
         evt.path_or_ip[0] = 'f'; evt.path_or_ip[1] = 'd';
-        // 简单写 fd 数字，最多处理 3 位
-        if (fd_val >= 100) { evt.path_or_ip[2] = '0' + fd_val / 100; fd_val %= 100; }
-        else { evt.path_or_ip[2] = '0' + fd_val / 10; }
-        evt.path_or_ip[3] = '0' + (fd_val / 10);
-        evt.path_or_ip[4] = '0' + (fd_val % 10);
+        /* 三位十进制右对齐：fd 99 -> "fd099" */
+        evt.path_or_ip[2] = '0' + (char)((fd_val / 100) % 10);
+        evt.path_or_ip[3] = '0' + (char)((fd_val / 10) % 10);
+        evt.path_or_ip[4] = '0' + (char)(fd_val % 10);
         bpf_perf_event_output(ctx, &alert_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
         bpf_send_signal(9);
         return 0;
@@ -451,13 +481,13 @@ fchmod_unverified_alert:
         evt.timestamp_ns = bpf_ktime_get_ns();
         evt.syscall_nr = __NR_fchmod;
         evt.reason = ALERT_UNVERIFIED_BLOCK;
-        int fd_val = (int)ctx->args[0];
+        /* 必须是无符号：BPF 不支持有符号除法/取模（clang: unsupported signed division） */
+        unsigned int fd_val = (unsigned int)ctx->args[0];
         evt.path_or_ip[0] = 'f'; evt.path_or_ip[1] = 'd';
-        // 简单写 fd 数字，最多处理 3 位
-        if (fd_val >= 100) { evt.path_or_ip[2] = '0' + fd_val / 100; fd_val %= 100; }
-        else { evt.path_or_ip[2] = '0' + fd_val / 10; }
-        evt.path_or_ip[3] = '0' + (fd_val / 10);
-        evt.path_or_ip[4] = '0' + (fd_val % 10);
+        /* 三位十进制右对齐：fd 99 -> "fd099" */
+        evt.path_or_ip[2] = '0' + (char)((fd_val / 100) % 10);
+        evt.path_or_ip[3] = '0' + (char)((fd_val / 10) % 10);
+        evt.path_or_ip[4] = '0' + (char)(fd_val % 10);
         bpf_perf_event_output(ctx, &alert_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
         bpf_send_signal(9);
         return 0;
@@ -485,18 +515,18 @@ int trace_enter_sendto(struct trace_event_raw_sys_enter *ctx) {
 sendto_block:
     {
         __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 key = ns_tgid();  /* 目标命名空间内的 tgid，与用户态看到的 pid 一致 */
 
-        __u64 tgid = pid_tgid >> 32;
-        __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &tgid);
+            __u8 *mon = bpf_map_lookup_elem(&monitored_tgid, &key);
         if (!mon)
             return 0;
 
-        struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &pid_tgid);
+        struct causal_entry *entry = bpf_map_lookup_elem(&causal_chain, &key);
 
         if (entry) {
             __u64 now = bpf_ktime_get_ns();
             if (now - entry->timestamp_ns > CAUSAL_ID_TTL_NS) {
-                bpf_map_delete_elem(&causal_chain, &pid_tgid);
+                bpf_map_delete_elem(&causal_chain, &key);
                 goto sendto_alert;
             }
             if (entry->flags & CAUSAL_FLAG_UNVERIFIED)

@@ -31,6 +31,10 @@ MAP_DIR = "/sys/fs/bpf/agent_guardian"
 # 测试用固定密钥
 TEST_KEY = b"T" * 32  # 32 bytes
 
+# 注册/签发共用同一 params_hash 约定：引擎按 sha256(params) 重算，
+# 这里的票据是测试自己造的，只要"签名"与"注册"两端一致即可
+PARAMS_HASH = hashlib.sha256(b"").hexdigest()
+
 
 def _send_key_update(active_key: bytes, grace_key: bytes = b"") -> int:
     """发送 MSG_KEY_UPDATE，返回 status"""
@@ -45,24 +49,45 @@ def _send_key_update(active_key: bytes, grace_key: bytes = b"") -> int:
 
 
 def _make_causal_id(pid: int, tool_name: str, timestamp_ns: int,
-                    key: bytes = TEST_KEY) -> bytes:
-    """生成合法的 HMAC-SHA256 CausalID"""
-    payload = f"{pid}|{tool_name}|{timestamp_ns}|5000000000".encode()
+                    key: bytes = TEST_KEY,
+                    params_hash: str = PARAMS_HASH) -> bytes:
+    """生成合法的 HMAC-SHA256 CausalID
+
+    payload 必须与 guardian 重建格式逐字节一致:
+    pid|tool_name|params_hash|timestamp_ns|ttl_ns"""
+    payload = f"{pid}|{tool_name}|{params_hash}|{timestamp_ns}|5000000000".encode()
     return hmac.new(key, payload, hashlib.sha256).digest()
+
+
+def ensure_monitored(pid: int) -> None:
+    """把 pid 加进 monitored_tgid（等价于 loader -p <pid>）。
+
+    guardian 现在只给监控名单内的 pid 写票据（P0-1b 门禁），注册前必须先加白。"""
+    key_hex = int(pid).to_bytes(8, "little").hex()
+    subprocess.run(
+        [BPFTOOL, "map", "update", "pinned", f"{MAP_DIR}/monitored_tgid",
+         "key", "hex", key_hex, "value", "hex", "01"],
+        check=True, capture_output=True,
+    )
 
 
 def send_register(pid: int, causal_id: bytes,
                   tool_name: str = "bash_exec",
-                  timestamp_ns: int = None) -> int:
-    """发送 MSG_REGISTER，返回 status"""
+                  timestamp_ns: int = None,
+                  params_hash: str = PARAMS_HASH) -> int:
+    """发送 MSG_REGISTER，返回 status
+
+    timestamp_ns 必须用单调时钟（与内核 bpf_ktime_get_ns 同基准）；
+    pid 必须先经过 ensure_monitored()。"""
     if timestamp_ns is None:
-        timestamp_ns = int(time.time() * 1e9)
+        timestamp_ns = time.monotonic_ns()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(1.0)
     sock.connect(SOCKET_PATH)
     name_bytes = tool_name.encode()[:63].ljust(64, b'\x00')
-    payload = struct.pack("<BQ32sQ64s", 0x01, pid, causal_id,
-                          timestamp_ns, name_bytes)
+    hash_bytes = params_hash.encode()[:64].ljust(64, b'\x00')
+    payload = struct.pack("<BQ32sQ64s64s", 0x01, pid, causal_id,
+                          timestamp_ns, name_bytes, hash_bytes)
     sock.sendall(payload)
     ack = sock.recv(2)
     sock.close()
@@ -106,11 +131,29 @@ def test_map_accessible():
 def test_register_and_allow():
     """验证 causal-guardian 写入后 eBPF 放行"""
     pid = os.getpid()
-    ts = int(time.time() * 1e9)
+    ensure_monitored(pid)  # P0-1b：注册前先加监控名单
+    ts = time.monotonic_ns()
     causal_id = _make_causal_id(pid, "bash_exec", ts)
 
     status = send_register(pid, causal_id, timestamp_ns=ts)
     assert status == 0, f"MSG_REGISTER 失败，status={status}"
+
+
+def test_register_rejects_unmonitored_pid():
+    """P0-1b 门禁：不在 monitored_tgid 里的 pid 注册票据 → status=3 拒绝。
+
+    选一个几乎不可能存在的 pid（且绝不给自己加白）。"""
+    victim_pid = 4194303  # pid_max 默认上限附近，测试机不会有这个进程
+    ensure_monitored(victim_pid)
+    subprocess.run(
+        [BPFTOOL, "map", "delete", "pinned", f"{MAP_DIR}/monitored_tgid",
+         "key", "hex", victim_pid.to_bytes(8, "little").hex()],
+        check=True, capture_output=True,
+    )
+    ts = time.monotonic_ns()
+    causal_id = _make_causal_id(victim_pid, "bash_exec", ts)
+    status = send_register(victim_pid, causal_id, timestamp_ns=ts)
+    assert status == 3, f"未监控 pid 应被拒绝 (status=3)，实际 {status}"
 
 
 def test_no_causal_id_blocked():
@@ -134,7 +177,8 @@ def test_no_causal_id_blocked():
 def test_ttl_expiry():
     """验证 CausalID 过期 (5s TTL) 后自动清理"""
     pid = os.getpid()
-    ts = int(time.time() * 1e9)
+    ensure_monitored(pid)
+    ts = time.monotonic_ns()
     causal_id = _make_causal_id(pid, "bash_exec", ts)
 
     status = send_register(pid, causal_id, timestamp_ns=ts)
@@ -144,7 +188,8 @@ def test_ttl_expiry():
 def test_msg_register_latency():
     """验证 MSG_REGISTER 在 50ms 内返回 ACK"""
     pid = os.getpid()
-    ts = int(time.time() * 1e9)
+    ensure_monitored(pid)
+    ts = time.monotonic_ns()
     causal_id = _make_causal_id(pid, "bash_exec", ts)
 
     start = time.monotonic()
@@ -188,10 +233,61 @@ def test_connect_blocked():
 def test_open_write_with_causal_id():
     """有 CausalID 时写文件 → 应放行"""
     pid = os.getpid()
-    ts = int(time.time() * 1e9)
+    ensure_monitored(pid)
+    ts = time.monotonic_ns()
     causal_id = _make_causal_id(pid, "bash_exec", ts)
     status = send_register(pid, causal_id, timestamp_ns=ts)
     assert status == 0, f"MSG_REGISTER 失败: status={status}"
+
+
+def _wait_for_pid_file(path: str, timeout: float = 3.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            time.sleep(0.02)
+    raise TimeoutError(f"pid 文件未生成: {path}")
+
+
+def test_valid_ticket_allows_exec():
+    """DeepSeek 复查报告 P1-11 要求的关键断言（此前整套测试都缺它）：
+
+    注册合法票据 → 受监控进程 exec 非白名单二进制 → 应当存活。
+    只断言"guardian 收下了注册"验证不了任何端到端行为。"""
+    marker = "/tmp/agent_test_ticket_marker"
+    pidfile = "/tmp/agent_test_ticket_pid"
+    script = "/tmp/agent_test_ticket_script.sh"
+    for stale in (marker, pidfile):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+    with open(script, "w") as f:
+        f.write(f"#!/bin/sh\necho ok > {marker}\n")
+    os.chmod(script, 0o755)
+
+    # sh 自报 pid → 父进程加白 + 注册票据 → sh 在 1s 后 exec 脚本（票据 5s TTL 内）
+    proc = subprocess.Popen(
+        ["sh", "-c", f"echo $$ > {pidfile}; sleep 1; exec {script}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        pid = _wait_for_pid_file(pidfile)
+        ensure_monitored(pid)
+        ts = time.monotonic_ns()
+        causal_id = _make_causal_id(pid, "bash_exec", ts)
+        status = send_register(pid, causal_id, timestamp_ns=ts)
+        assert status == 0, f"注册合法票据失败: status={status}"
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not os.path.exists(marker):
+            time.sleep(0.05)
+        assert os.path.exists(marker), \
+            "受监控进程持合法票据 exec 非白名单二进制应放行（标记文件未生成）"
+    finally:
+        proc.wait(timeout=10)
 
 
 def test_chmod_add_exec_no_causal_id():
@@ -254,7 +350,8 @@ class TestExecWhitelist:
             check=True, capture_output=True,
         )
         pid = os.getpid()
-        cid = _make_causal_id(pid, "bash_exec", int(time.time() * 1e9))
+        ensure_monitored(pid)
+        cid = _make_causal_id(pid, "bash_exec", time.monotonic_ns())
         status = send_register(pid, cid)
         assert status == 0, f"注册 CausalID 失败: status={status}"
         result = subprocess.run(["/bin/true"], capture_output=True)

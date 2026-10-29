@@ -9,11 +9,36 @@ import httpx
 import pytest
 
 
+def _free_tcp_port() -> int:
+    """取一个当前可用的本地端口。
+
+    固定端口 27042 在部分环境（WSL 端口转发、本机已有服务）会被占用，
+    导致 GadgetBridge 绑定失败、用例误报。改成动态端口更稳。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+# 模块级把 GadgetBridge 的监听端口换成空闲端口（仅影响测试）
+import src.frida.bridge as _bridge_mod  # noqa: E402
+
+_bridge_mod.GADGET_PORT = _free_tcp_port()
+
+
 class TestFridaBridgePid:
     """_get_host_pid 测试"""
 
-    def test_get_host_pid_with_namespace(self):
-        """有 namespace 时返回 NSpid 第二列（宿主机 PID）"""
+    def test_get_host_pid_is_namespace_local(self):
+        """P0-6：必须返回本命名空间的 pid，而不是猜的"宿主机 pid"。
+
+        旧实现取 NSpid 第二列，但 bpf_get_current_pid_tgid() 返回的是
+        init 命名空间 pid，两者对不上；现在统一用本命名空间 pid，
+        再由内核通过 /proc 的 dev/ino 换算。
+        """
         from src.frida.bridge import FridaBridge
         m = MagicMock()
         m.return_value.__enter__.return_value = [
@@ -21,10 +46,10 @@ class TestFridaBridgePid:
         ]
         with patch("builtins.open", m):
             bridge = FridaBridge()
-        assert bridge.host_pid == 45678
+        assert bridge.host_pid == os.getpid()
 
-    def test_get_host_pid_no_namespace(self):
-        """无 namespace 时回退到第一列 PID"""
+    def test_get_host_pid_ignores_nspid(self):
+        """NSpid 不再影响取值：永远是本命名空间 pid"""
         from src.frida.bridge import FridaBridge
         m = MagicMock()
         m.return_value.__enter__.return_value = [
@@ -32,7 +57,7 @@ class TestFridaBridgePid:
         ]
         with patch("builtins.open", m):
             bridge = FridaBridge()
-        assert bridge.host_pid == 12345
+        assert bridge.host_pid == os.getpid()
 
     def test_get_host_pid_no_nspid_falls_back(self):
         """没有 NSpid 行时回退到 os.getpid()"""
@@ -63,6 +88,7 @@ class TestFridaBridgeAuditEngine:
             "reason": "正常调用",
             "mode": "enforcing",
         }
+        mock_response.status_code = 200   # 真实 httpx.Response 有 status_code；非 200 现在按拒绝处理
 
         with patch("httpx.AsyncClient") as mock_client:
             mock_client.return_value.__aenter__.return_value.post.return_value = mock_response
@@ -71,8 +97,11 @@ class TestFridaBridgeAuditEngine:
             assert result["causal_id"] is not None
 
     @pytest.mark.asyncio
-    async def test_request_causal_id_timeout(self):
-        """审计引擎超时 100ms → 降级为 UNVERIFIED"""
+    async def test_request_causal_id_timeout_fails_closed(self):
+        """审计引擎超时 → 拒绝（fail-closed）。
+
+        修复前这里返回 decision="allow"，等于"引擎挂了就全放行"（P1-9）。
+        """
         from src.frida.bridge import FridaBridge
 
         bridge = FridaBridge()
@@ -80,8 +109,8 @@ class TestFridaBridgeAuditEngine:
             mock_client.return_value.__aenter__.return_value.post.side_effect = httpx.TimeoutException("timeout")
             result = await bridge.request_causal_id("bash_exec", "ls -la", "user input")
             assert result["causal_id"] is None
-            assert result["decision"] == "allow"
-            assert result["reason"] == "timeout"
+            assert result["decision"] == "block"
+            assert result["reason"].startswith("engine_unavailable")
 
     @pytest.mark.asyncio
     async def test_request_causal_id_params_hash(self):
@@ -96,6 +125,7 @@ class TestFridaBridgeAuditEngine:
         mock_response.json.return_value = {
             "causal_id": None, "decision": "ask", "taint_tags": [], "reason": "test", "mode": "ask"
         }
+        mock_response.status_code = 200
 
         with patch("httpx.AsyncClient") as mock_client:
             mock_post = mock_client.return_value.__aenter__.return_value.post
@@ -114,9 +144,11 @@ class TestFridaBridgeSocket:
 
         bridge = FridaBridge()
         bridge.sock = MagicMock()
+        bridge._ns_sent = True   # 只测注册路径，跳过命名空间推送
         bridge.sock.recv.return_value = b"\x01\x00"  # ACK status=0
 
-        result = bridge._send_causal_id(b"\x01" * 32, "test_tool")
+        result = bridge._send_causal_id(b"\x01" * 32, "test_tool", time.monotonic_ns(),
+                             hashlib.sha256(b"test").hexdigest())
         assert result is True
         bridge.sock.sendall.assert_called_once()
 
@@ -128,7 +160,8 @@ class TestFridaBridgeSocket:
         bridge.sock = MagicMock()
         bridge.sock.recv.return_value = b"\x01\x01"  # ACK status=1
 
-        result = bridge._send_causal_id(b"\x01" * 32, "test_tool")
+        result = bridge._send_causal_id(b"\x01" * 32, "test_tool", time.monotonic_ns(),
+                             hashlib.sha256(b"test").hexdigest())
         assert result is False
 
     def test_send_causal_id_no_socket(self):
@@ -139,7 +172,8 @@ class TestFridaBridgeSocket:
         bridge.sock = None
         with patch("socket.socket") as mock_socket_class:
             mock_socket_class.return_value.connect.side_effect = FileNotFoundError
-            result = bridge._send_causal_id(b"\x01" * 32, "test_tool")
+            result = bridge._send_causal_id(b"\x01" * 32, "test_tool", time.monotonic_ns(),
+                             hashlib.sha256(b"test").hexdigest())
             assert result is False
 
     @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"),
@@ -154,7 +188,8 @@ class TestFridaBridgeSocket:
         mock_sock.recv.return_value = b"\x01\x00"
 
         with patch("socket.socket", return_value=mock_sock):
-            result = bridge._send_causal_id(b"\x01" * 32, "test_tool")
+            result = bridge._send_causal_id(b"\x01" * 32, "test_tool", time.monotonic_ns(),
+                             hashlib.sha256(b"test").hexdigest())
             assert result is True
             mock_sock.connect.assert_called_once_with("/var/run/causal-guardian.sock")
 
@@ -370,7 +405,7 @@ class TestPskAuth:
         try:
             # 错误 PSK → rejected
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", 27042))
+            sock.connect(("127.0.0.1", _bridge_mod.GADGET_PORT))
             _send_msg(sock, {"type": "auth", "psk": "wrong_psk", "pid": 1})
             resp = _recv_msg(sock, timeout=1.0)
             assert resp is not None and resp["status"] == "rejected"
@@ -378,7 +413,7 @@ class TestPskAuth:
 
             # 正确 PSK → ok
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock2.connect(("127.0.0.1", 27042))
+            sock2.connect(("127.0.0.1", _bridge_mod.GADGET_PORT))
             _send_msg(sock2, {"type": "auth", "psk": "test_auth_psk_32bytes_xxxxxxxxx", "pid": 42})
             resp2 = _recv_msg(sock2, timeout=1.0)
             assert resp2 is not None and resp2["status"] == "ok"
@@ -399,7 +434,7 @@ class TestPskAuth:
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", 27042))
+            sock.connect(("127.0.0.1", _bridge_mod.GADGET_PORT))
             # 不发 auth，等待超时
             time.sleep(3.5)
             try:

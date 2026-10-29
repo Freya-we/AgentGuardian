@@ -19,6 +19,23 @@ except ImportError:  # frida 为可选依赖，仅真实插桩时需要；Gadget
 RUNTIME_PYTHON = "python"
 RUNTIME_NODE = "node"
 
+# 引擎 API 令牌：与 server.py 的 _load_api_token() 同源
+ENGINE_TOKEN_PATH = "/etc/agent-guardian/engine.token"
+# 签名请求超时。修复前是 100ms 硬超时且超时按 allow 处理（P1-9），
+# 现改为可配置 + 超时 fail-closed。
+_ENGINE_TIMEOUT_S = float(os.environ.get("AGENT_GUARDIAN_SIGN_TIMEOUT", "0.3"))
+
+
+def _load_engine_token() -> str:
+    token = os.environ.get("AGENT_GUARDIAN_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        with open(ENGINE_TOKEN_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
 
 class FridaBridge:
     """Frida ↔ 审计引擎 ↔ causal-guardian 通信桥"""
@@ -30,6 +47,7 @@ class FridaBridge:
         self.host_pid = self._get_host_pid()
         self.session_id = os.environ.get("AGENT_SESSION_ID", "default")
         self.sock = None
+        self._ns_sent = False
         self._input_messages = ""
         self._system_prompt = ""
         self._last_http_call = None
@@ -38,18 +56,44 @@ class FridaBridge:
     # ── PID ──────────────────────────────────────────
 
     def _get_host_pid(self) -> int:
-        """从 /proc/self/status 获取宿主机视角 PID（NSpid 第二列）"""
-        try:
-            with open("/proc/self/status") as f:
-                for line in f:
-                    if line.startswith("NSpid:"):
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            return int(parts[2])  # 宿主机 PID
-                        return int(parts[1])      # 无 namespace，即自身 PID
-        except Exception:
-            pass
+        """返回**当前命名空间内**的 PID —— 这才是 eBPF 侧换算后能对上的值。
+
+        历史上这里试图从 /proc/self/status 的 NSpid 里取"宿主机 PID"，但：
+          · 进程与读取者在同一命名空间时，NSpid 只有一列，取到的仍是本地 PID；
+          · 不同命名空间层级下列数不同，parts[2] 的含义不稳定；
+          · bpf_get_current_pid_tgid() 返回的永远是 init 命名空间的 PID，
+            与这里的猜测必然对不上（WSL 实测恒定相差 688）。
+
+        正确做法见 _send_ns_update()：把 /proc 的 dev/ino 交给内核，
+        由 bpf_get_ns_current_pid_tgid() 完成换算。
+        """
         return os.getpid()
+
+    # ── 命名空间标识（P0-6）──────────────────────────
+
+    def _send_ns_update(self) -> bool:
+        """把 /proc 挂载点的 dev/ino 推给 causal-guardian。
+
+        内核据此用 bpf_get_ns_current_pid_tgid() 换算出"本命名空间内的 pid"，
+        与我们发送的 pid 一致。Docker / k8s / WSL 下必需。
+
+        实测（WSL2）：不写 ns_id 或写 /proc 的 dev/ino 时，监控命中率都是 0；
+        写 /proc/self/ns/pid 的 dev/ino 后命中（passed=1）。
+        """
+        try:
+            # 注意：必须取 pid 命名空间的 nsfs inode（/proc/self/ns/pid），
+            # 而不是 /proc 挂载点本身。实测用 /proc 的 dev/ino 时命中率仍为 0。
+            st = os.stat("/proc/self/ns/pid")
+        except OSError:
+            return False
+        try:
+            if self.sock is None:
+                self._connect_socket()
+            self.sock.sendall(struct.pack("<BQQ", 0x03, st.st_dev, st.st_ino))
+            ack = self.sock.recv(2)
+            return len(ack) == 2 and ack[1] == 0
+        except Exception:
+            return False
 
     # ── 审计引擎通信 ─────────────────────────────────
 
@@ -57,7 +101,11 @@ class FridaBridge:
                                 input_messages: str) -> dict:
         """调审计引擎签名端点"""
         params_hash = hashlib.sha256(params.encode()).hexdigest()
-        async with httpx.AsyncClient(timeout=0.1) as client:  # 100ms 硬超时
+        headers = {}
+        token = _load_engine_token()
+        if token:
+            headers["X-Guardian-Token"] = token
+        async with httpx.AsyncClient(timeout=_ENGINE_TIMEOUT_S) as client:
             try:
                 resp = await client.post(
                     f"{self.audit_engine_url}/api/v1/causal-id/sign",
@@ -69,11 +117,19 @@ class FridaBridge:
                         "input_messages": input_messages,
                         "session_id": self.session_id,
                     },
+                    headers=headers,
                 )
+                if resp.status_code != 200:
+                    # 401/5xx 不能当成"允许"，否则鉴权失效会被静默吞掉
+                    return {"causal_id": None, "decision": "block",
+                            "reason": f"engine_http_{resp.status_code}",
+                            "mode": "ask"}
                 return resp.json()
-            except httpx.TimeoutException:
-                return {"causal_id": None, "decision": "allow",
-                        "reason": "timeout", "mode": "ask"}
+            except Exception as e:  # 超时/连接失败/解析失败
+                # fail-closed：拿不到决策就不放行（原实现返回 allow，P1-9）
+                return {"causal_id": None, "decision": "block",
+                        "reason": f"engine_unavailable: {type(e).__name__}",
+                        "mode": "ask"}
 
     # ── Unix Socket ──────────────────────────────────
 
@@ -82,16 +138,27 @@ class FridaBridge:
         self.sock.settimeout(0.05)  # 50ms
         self.sock.connect("/var/run/causal-guardian.sock")
 
-    def _send_causal_id(self, causal_id: bytes, tool_name: str) -> bool:
-        """向 causal-guardian 注册 CausalID，返回是否成功"""
+    def _send_causal_id(self, causal_id: bytes, tool_name: str,
+                        timestamp_ns: int, params_hash: str) -> bool:
+        """向 causal-guardian 注册 CausalID，返回是否成功。
+
+        timestamp_ns 必须是引擎签名时用的那个值：guardian 会用
+        "pid|tool|params_hash|ts|ttl" 重建 HMAC payload 验签，自己另取时间
+        必然失败（P0-1 断点①）；params_hash 必须与签发时 sha256(params)
+        一致，否则验签同样失败（P1-2）。
+        """
         if self.sock is None:
             try:
                 self._connect_socket()
             except Exception:
                 return False
+        if not self._ns_sent:
+            # 首次注册前先把命名空间标识推过去，否则内核算不出本空间的 pid
+            self._ns_sent = self._send_ns_update()
         name_bytes = tool_name.encode()[:63].ljust(64, b'\x00')
-        msg = struct.pack("<BQ32sQ64s", 0x01, self.host_pid,
-                          causal_id, time.time_ns(), name_bytes)
+        hash_bytes = params_hash.encode()[:64].ljust(64, b'\x00')
+        msg = struct.pack("<BQ32sQ64s64s", 0x01, self.host_pid,
+                          causal_id, timestamp_ns, name_bytes, hash_bytes)
         try:
             self.sock.sendall(msg)
             ack = self.sock.recv(2)
@@ -134,14 +201,23 @@ class FridaBridge:
                     self.request_causal_id(tool_name, params, input_msgs)
                 )
                 loop.close()
-            except Exception:
-                result = {"causal_id": None, "decision": "allow",
-                          "reason": "bridge_error", "mode": "ask"}
+            except Exception as e:
+                # fail-closed：桥接出错时不能假装"允许"（P1-9）
+                result = {"causal_id": None, "decision": "block",
+                          "reason": f"bridge_error: {type(e).__name__}",
+                          "mode": "ask"}
 
             causal_id_str = None
-            if result["decision"] == "allow" and result.get("causal_id"):
+            # 注册消息里的 params_hash 必须与引擎签名时的一致（P1-2），
+            # 引擎按 sha256(params) 重算，这里用同一个算法。
+            register_hash = hashlib.sha256(params.encode()).hexdigest()
+            ts_ns = result.get("timestamp_ns")
+            if ts_ns is None:
+                # 引擎没给时间戳（旧版本/异常）→ 用单调时钟兜底，并明确记录
+                ts_ns = time.monotonic_ns()
+            if result.get("decision") == "allow" and result.get("causal_id"):
                 causal_id_raw = bytes.fromhex(result["causal_id"])
-                if self._send_causal_id(causal_id_raw, tool_name):
+                if self._send_causal_id(causal_id_raw, tool_name, ts_ns, register_hash):
                     causal_id_str = result["causal_id"]
                 else:
                     causal_id_str = "UNVERIFIED_" + secrets.token_hex(8)
@@ -172,9 +248,14 @@ class FridaBridge:
             )
 
             causal_id_str = None
-            if result["decision"] == "allow" and result.get("causal_id"):
+            register_hash = hashlib.sha256(params.encode()).hexdigest()
+            ts_ns = result.get("timestamp_ns")
+            if ts_ns is None:
+                # 引擎没给时间戳（旧版本/异常）→ 用单调时钟兜底，并明确记录
+                ts_ns = time.monotonic_ns()
+            if result.get("decision") == "allow" and result.get("causal_id"):
                 causal_id_raw = bytes.fromhex(result["causal_id"])
-                if self._send_causal_id(causal_id_raw, tool_name):
+                if self._send_causal_id(causal_id_raw, tool_name, ts_ns, register_hash):
                     causal_id_str = result["causal_id"]
                 else:
                     causal_id_str = "UNVERIFIED_" + secrets.token_hex(8)
@@ -260,16 +341,20 @@ def _send_msg(sock: socket.socket, msg: dict) -> bool:
         return False
 
 
-def _send_causal_id_unix(causal_id: bytes, tool_name: str, pid: int) -> bool:
-    """向 causal-guardian 注册 CausalID"""
+def _send_causal_id_unix(causal_id: bytes, tool_name: str, pid: int,
+                         timestamp_ns: int, params_hash: str) -> bool:
+    """向 causal-guardian 注册 CausalID
+
+    timestamp_ns / params_hash 必须与引擎签名时的值一致（P0-1 断点① / P1-2）"""
     sock = None
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(0.05)
         sock.connect("/var/run/causal-guardian.sock")
         name_bytes = tool_name.encode()[:63].ljust(64, b'\x00')
-        msg = struct.pack("<BQ32sQ64s", 0x01, pid,
-                          causal_id, time.time_ns(), name_bytes)
+        hash_bytes = params_hash.encode()[:64].ljust(64, b'\x00')
+        msg = struct.pack("<BQ32sQ64s64s", 0x01, pid,
+                          causal_id, timestamp_ns, name_bytes, hash_bytes)
         sock.sendall(msg)
         ack = sock.recv(2)
         return ack[1] == 0
@@ -285,7 +370,11 @@ async def _http_sign_request(audit_url: str, pid: int, tool_name: str,
                               input_messages: str, session_id: str) -> dict:
     """HTTP POST 到审计引擎签名端点"""
     import httpx
-    async with httpx.AsyncClient(timeout=0.1) as client:
+    headers = {}
+    token = _load_engine_token()
+    if token:
+        headers["X-Guardian-Token"] = token
+    async with httpx.AsyncClient(timeout=_ENGINE_TIMEOUT_S) as client:
         try:
             resp = await client.post(
                 f"{audit_url}/api/v1/causal-id/sign",
@@ -297,11 +386,17 @@ async def _http_sign_request(audit_url: str, pid: int, tool_name: str,
                     "input_messages": input_messages,
                     "session_id": session_id,
                 },
+                headers=headers,
             )
+            if resp.status_code != 200:
+                return {"causal_id": None, "decision": "block",
+                        "reason": f"engine_http_{resp.status_code}", "mode": "ask"}
             return resp.json()
-        except httpx.TimeoutException:
-            return {"causal_id": None, "decision": "allow",
-                    "reason": "timeout", "mode": "ask"}
+        except Exception as e:
+            # fail-closed（P1-9）
+            return {"causal_id": None, "decision": "block",
+                    "reason": f"engine_unavailable: {type(e).__name__}",
+                    "mode": "ask"}
 
 
 def handle_client(sock: socket.socket, audit_url: str) -> None:
@@ -362,13 +457,19 @@ def handle_client(sock: socket.socket, audit_url: str) -> None:
                     )
                     loop.close()
                 except Exception as e:
-                    resp = {"causal_id": None, "decision": "allow",
-                            "reason": f"bridge_error: {e}", "mode": "ask"}
+                    # fail-closed（P1-9）
+                    resp = {"causal_id": None, "decision": "block",
+                            "reason": f"bridge_error: {type(e).__name__}",
+                            "mode": "ask"}
 
                 causal_id_str = None
+                ts_ns = resp.get("timestamp_ns")
+                if ts_ns is None:
+                    ts_ns = time.monotonic_ns()
                 if resp.get("decision") == "allow" and resp.get("causal_id"):
                     causal_id_raw = bytes.fromhex(resp["causal_id"])
-                    if _send_causal_id_unix(causal_id_raw, tool_name, client_pid):
+                    if _send_causal_id_unix(causal_id_raw, tool_name,
+                                            client_pid, ts_ns, params_hash):
                         causal_id_str = resp["causal_id"]
                     else:
                         causal_id_str = "UNVERIFIED_" + secrets.token_hex(8)
@@ -379,7 +480,7 @@ def handle_client(sock: socket.socket, audit_url: str) -> None:
                     "type": "causal_id_response",
                     "request_id": msg.get("request_id", ""),
                     "causal_id": causal_id_str,
-                    "decision": resp.get("decision", "allow"),
+                    "decision": resp.get("decision", "block"),
                     "reason": resp.get("reason", ""),
                 })
 

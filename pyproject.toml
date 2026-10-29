@@ -13,11 +13,18 @@ dependencies = [
     "pypdf2>=3.0.1",
     "fpdf2>=2.8.7",
     "flask>=3.1.3",
-    "onnxruntime>=1.18",
     "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
+# 语义审查（ONNX 嵌入模型）是可选能力：未安装时 slm_reviewer.is_available()=False，
+# 引擎自动降级为规则引擎。从主依赖里挪出来，避免每次安装都拉 ~50MB 的 runtime，
+# 也避免漏装 transformers 导致的"永远不可用"。
+slm = [
+    "onnxruntime>=1.18",
+    "transformers>=4.40",
+]
+
 export = [
     "optimum[onnxruntime]>=1.22",
     "sentence-transformers>=3.0",

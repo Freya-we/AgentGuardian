@@ -64,10 +64,15 @@ class StatsBaseline:
 
         taint_ratio = s["tainted_count"] / s["total"] if s["total"] > 0 else 0.0
 
+        # 理论最大熵：k 个不同工具等概率出现时为 log2(k)。
+        # 原实现写成 entropy * 1.5，是凭空造的上界（P1-6），会让大屏指标失去意义。
+        distinct_tools = len(tool_counts)
+        entropy_upper = math.log2(distinct_tools) if distinct_tools > 1 else 0.0
+
         return StatsSnapshot(
             interval_p95_ms=p95,
             entropy_current=entropy,
-            entropy_heuristic_upper=entropy * 1.5,
+            entropy_heuristic_upper=entropy_upper,
             taint_ratio=taint_ratio,
             graph_unknown_count=s["graph_unknown"],
         )

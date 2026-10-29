@@ -86,6 +86,17 @@ class KeyManager:
         logger.info(f"KeyManager 初始化: round={start_round}")
         return SessionKeys(active=self._active, grace=self._grace, round=self._round)
 
+    def push_current(self) -> bool:
+        """把当前 active/grace 推送到 causal-guardian。
+
+        必须在服务启动后立刻调用一次：BPF 的 session_key map 初始全零，
+        若不主动推送，guardian 会拿全零 key 验签，所有票据注册都会失败
+        （表现为 L1 层"静默失效"——引擎以为在放行，内核却一律 SIGKILL）。
+        """
+        if not hasattr(self, "_active"):
+            raise RuntimeError("KeyManager not initialized")
+        return _send_key_update(self._active, self._grace)
+
     async def rotate(self) -> SessionKeys:
         if not hasattr(self, "_master_key"):
             raise RuntimeError("KeyManager not initialized")

@@ -219,8 +219,12 @@ int main(int argc, char **argv) {
     bpf_map__pin(skel->maps.causal_chain, MAP_PIN_DIR "/causal_chain");
     bpf_map__pin(skel->maps.session_key, MAP_PIN_DIR "/session_key");
     bpf_map__pin(skel->maps.exec_whitelist, MAP_PIN_DIR "/exec_whitelist");
+    bpf_map__pin(skel->maps.ns_id_map, MAP_PIN_DIR "/ns_id_map");
     bpf_map__pin(skel->maps.monitored_tgid, MAP_PIN_DIR "/monitored_tgid");
-    chmod(MAP_PIN_DIR "/monitored_tgid", 0666);
+    /* 注意（P1-8）：这里曾是 0666，任何本地用户都能把任意 PID 写进监控名单，
+       使其所有危险 syscall 因"无票"被 SIGKILL —— 等于给本机装了一个杀任意进程的开关。
+       改为 0600，只有 root 能增删监控对象。 */
+    chmod(MAP_PIN_DIR "/monitored_tgid", 0600);
     bpf_map__pin(skel->maps.alert_events, MAP_PIN_DIR "/alert_events");
 
     /* 6. 初始化白名单 */
@@ -263,6 +267,7 @@ cleanup:
     bpf_map__unpin(skel->maps.causal_chain, MAP_PIN_DIR "/causal_chain");
     bpf_map__unpin(skel->maps.session_key, MAP_PIN_DIR "/session_key");
     bpf_map__unpin(skel->maps.exec_whitelist, MAP_PIN_DIR "/exec_whitelist");
+    bpf_map__unpin(skel->maps.ns_id_map, MAP_PIN_DIR "/ns_id_map");
     bpf_map__unpin(skel->maps.monitored_tgid, MAP_PIN_DIR "/monitored_tgid");
     bpf_map__unpin(skel->maps.alert_events, MAP_PIN_DIR "/alert_events");
     execve_monitor_bpf__destroy(skel);

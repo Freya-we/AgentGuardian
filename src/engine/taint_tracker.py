@@ -54,14 +54,22 @@ class TaintTracker:
     def is_tainted(self, session_id: str) -> bool:
         return len(self._sessions.get(session_id, [])) > 0
 
-    def cleanup_old_sessions(self, ttl_seconds: int | None = None) -> int:
-        """清理超过 TTL 未访问的会话，返回清理数量"""
+    def expired_session_ids(self, ttl_seconds: int | None = None) -> list[str]:
+        """返回超过 TTL 未访问的会话 id，不删除（供跨容器清理联动使用）"""
         ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
         now = time.monotonic()
-        expired = [
+        return [
             sid for sid, last in self._last_access.items()
             if now - last > ttl
         ]
+
+    def active_session_ids(self) -> list[str]:
+        """返回仍持有污点条目的会话 id"""
+        return list(self._sessions.keys())
+
+    def cleanup_old_sessions(self, ttl_seconds: int | None = None) -> int:
+        """清理超过 TTL 未访问的会话，返回清理数量"""
+        expired = self.expired_session_ids(ttl_seconds)
         for sid in expired:
             self._sessions.pop(sid, None)
             self._last_access.pop(sid, None)
